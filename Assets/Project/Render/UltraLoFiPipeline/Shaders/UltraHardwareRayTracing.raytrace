@@ -1,0 +1,640 @@
+#pragma max_recursion_depth 1
+
+struct UltraRTTriangle
+{
+    float3 n0; float u0;
+    float3 n1; float v0;
+    float3 n2; float u1;
+    float  v1; float u2; float v2; float pad;
+};
+
+struct UltraRTInstanceData
+{
+    float4x4 normalMatrix;       // Inverse-transpose matrix for exact world normals under non-uniform scale
+    float4 baseColorAndMetallic; // rgb: albedo, a: metallic
+    float4 surfaceParams;        // x: smoothness, y: reflectance, z: clearCoatMask, w: clearCoatSmoothness
+    float4 sssColorAndStrength;  // rgb: sssColor, a: sssStrength
+    float4 translucencyParams;   // x: translucencyStrength, y: thickness, z: sssWrap, w: patternType
+    float4 emissionAndTexScale;  // rgb: emission, a: texScale
+    uint triangleOffset;
+    uint triangleCount;
+    uint flags;
+    uint pad;
+};
+
+struct UltraRTPointLight
+{
+    float4 positionAndRange;     // xyz: posWS, w: range
+    float4 colorAndIntensity;    // rgb: linear color * intensity, a: unused
+};
+
+struct UltraRayPayload
+{
+    int instanceID;
+    uint primitiveIndex;
+    float2 barycentrics;
+    float hitDistance;
+    uint isFrontFace;
+};
+
+struct AttributeData
+{
+    float2 barycentrics;
+};
+
+RaytracingAccelerationStructure _UltraAccelStruct;
+StructuredBuffer<UltraRTTriangle> _UltraRTTriangles;
+StructuredBuffer<UltraRTInstanceData> _UltraRTInstances;
+StructuredBuffer<UltraRTPointLight> _UltraRTLights;
+
+Texture2D<float4> _SourceColorTex;
+Texture2D<float> _CameraDepthTexture;
+Texture2D<float4> _CameraNormalsTexture;
+
+RWTexture2D<float4> _OutRTAO;
+RWTexture2D<float4> _OutRTGIAndShadows;
+RWTexture2D<float4> _OutRTReflectionsAndVolumetrics;
+RWTexture2D<float4> _OutRTSubsurface;
+
+float4 _UltraCamPosWS;
+float4 _UltraCamForward;
+float4 _UltraCamRight;
+float4 _UltraCamUp;
+float4 _UltraCamProjParams; // x: aspect, y: tanHalfFov, z: near, w: far
+float4 _UltraLowResSize;    // x: lowW, y: lowH, z: 1/lowW, w: 1/lowH
+float4 _UltraFullScreenSize;// x: fullW, y: fullH, z: 1/fullW, w: 1/fullH
+float4 _UltraZBufferParams;
+float4 _UltraMainLightDir;  // xyz: dir, w: unused
+float4 _UltraMainLightColor;// rgb: color, a: unused
+float4 _UltraRTParams;      // x: activeLightCount, y: maxReflBounces, z: giRaysPerPixel, w: rtShadowsEnabled
+
+float4 _UltraAOParams1;     // x: intensity, y: radius, z: power, w: directOcclusion
+float4 _UltraAOParams2;     // x: dirCount, y: stepsPerDir, z: multiBounceTint, w: maxDistance
+
+float4 _UltraGIParams1;     // x: intensity, y: rayCount, z: stepsPerRay, w: rayRadius
+float4 _UltraGIParams2;     // x: thickness, y: emissiveBoost, z: bounceSaturation, w: skyContrib
+float4 _UltraGISkyColor;
+float4 _UltraGIGroundColor;
+float4 _UltraContactShadowParams; // x: enabled, y: length, z: intensity, w: steps
+
+float4 _UltraSSSParams;     // x: enabled, y: intensity, z: radius, w: depthFalloff
+float4 _UltraSSSScatterColor;
+
+float4 _UltraSSRParams;     // x: enabled, y: intensity, z: maxSteps, w: maxDistance
+float4 _UltraSSRParams2;    // x: thickness, y: fresnelPower, z: unused, w: unused
+float4 _UltraVolumetricParams; // x: enabled, y: intensity, z: steps, w: maxDistance
+float4 _UltraVolumetricParams2; // x: mieAnisotropyG, y: heightFalloff, z: unused, w: unused
+
+static const float kPI = 3.14159265359;
+static const float kTwoPI = 6.28318530718;
+static const float kInvPI = 0.31830988618;
+
+float LuminanceRT(float3 c)
+{
+    return dot(c, float3(0.2126729, 0.7151522, 0.0721750));
+}
+
+float InterleavedGradientNoiseRT(float2 pixelCoord)
+{
+    float3 magic = float3(0.06711056, 0.00583715, 52.9829189);
+    return frac(magic.z * frac(dot(pixelCoord, magic.xy)));
+}
+
+void BuildOrthonormalBasisRT(float3 N, out float3 T, out float3 B)
+{
+    float3 up = abs(N.y) < 0.999 ? float3(0.0, 1.0, 0.0) : float3(1.0, 0.0, 0.0);
+    T = normalize(cross(up, N));
+    B = cross(N, T);
+}
+
+float LinearEyeDepthRT(float rawDepth)
+{
+    return 1.0 / (_UltraZBufferParams.z * rawDepth + _UltraZBufferParams.w);
+}
+
+bool IsSkyDepthRT(float rawDepth)
+{
+    return (rawDepth <= 0.00001) || (rawDepth >= 0.99999);
+}
+
+float3 ReconstructWorldPosRT(float2 uv, float eyeDepth)
+{
+    float2 ndc = uv * 2.0 - 1.0;
+    float aspect = _UltraCamProjParams.x;
+    float tanHalfFov = _UltraCamProjParams.y;
+
+    float3 viewRayWS = _UltraCamForward.xyz
+                     + (ndc.x * aspect * tanHalfFov) * _UltraCamRight.xyz
+                     + (ndc.y * tanHalfFov) * _UltraCamUp.xyz;
+    return _UltraCamPosWS.xyz + viewRayWS * eyeDepth;
+}
+
+float3 EvaluateProceduralSkyRT(float3 rayDir)
+{
+    float3 sunDir = normalize(_UltraMainLightDir.xyz);
+    float upFactor = saturate(rayDir.y * 0.5 + 0.5);
+    float horizon = pow(1.0 - abs(rayDir.y), 3.0);
+
+    float3 skyBase = lerp(_UltraGIGroundColor.rgb * 0.85, _UltraGISkyColor.rgb * 1.15, smoothstep(0.35, 0.85, upFactor));
+    skyBase = lerp(skyBase, float3(0.85, 0.78, 0.58), horizon * 0.45);
+
+    float sunCos = dot(rayDir, sunDir);
+    float sunGlow = pow(saturate(sunCos), 32.0) * 0.65;
+    float sunDisk = smoothstep(0.9985, 0.9996, sunCos) * 6.0;
+
+    return skyBase + _UltraMainLightColor.rgb * (sunGlow + sunDisk);
+}
+
+// Smooth organic marble/stone variation without rectangular dark frames
+float3 ApplyProceduralPatternRT(float3 baseColor, float2 uv, float patternType)
+{
+    if (patternType > 1.5) // Smooth Veined Marble
+    {
+        float vein = sin((uv.x * 2.5 + uv.y * 3.5 + sin(uv.x * 5.0 + uv.y * 2.0) * 0.55) * kPI) * 0.5 + 0.5;
+        return baseColor * lerp(0.88, 1.04, vein);
+    }
+    return baseColor;
+}
+
+bool TraceOcclusionRay(float3 origin, float3 dir, float minT, float maxT)
+{
+    RayDesc ray;
+    ray.Origin = origin;
+    ray.Direction = dir;
+    ray.TMin = minT;
+    ray.TMax = maxT;
+
+    UltraRayPayload payload;
+    payload.instanceID = -1;
+    payload.primitiveIndex = 0;
+    payload.barycentrics = 0.0;
+    payload.hitDistance = -1.0;
+    payload.isFrontFace = 1;
+
+    uint flags = RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_FORCE_OPAQUE;
+    TraceRay(_UltraAccelStruct, flags, 0xFF, 0, 1, 0, ray, payload);
+    return payload.hitDistance > 0.0;
+}
+
+UltraRayPayload TraceClosestRay(float3 origin, float3 dir, float minT, float maxT)
+{
+    RayDesc ray;
+    ray.Origin = origin;
+    ray.Direction = dir;
+    ray.TMin = minT;
+    ray.TMax = maxT;
+
+    UltraRayPayload payload;
+    payload.instanceID = -1;
+    payload.primitiveIndex = 0;
+    payload.barycentrics = 0.0;
+    payload.hitDistance = -1.0;
+    payload.isFrontFace = 1;
+
+    TraceRay(_UltraAccelStruct, RAY_FLAG_FORCE_OPAQUE, 0xFF, 0, 1, 0, ray, payload);
+    return payload;
+}
+
+// Evaluates full PBR + Subsurface Scattering + Translucency + Punctual Lights + Hardware Sun Shadow at any 3D BVH hit
+float3 ShadeRayHit(
+    UltraRayPayload hit,
+    float3 rayOrigin,
+    float3 rayDir,
+    bool castShadowRay,
+    out float3 outHitPosWS,
+    out float3 outHitNormalWS,
+    out float outReflectivity,
+    out float3 outFresnelWeight)
+{
+    outHitPosWS = rayOrigin + rayDir * hit.hitDistance;
+    UltraRTInstanceData inst = _UltraRTInstances[hit.instanceID];
+    UltraRTTriangle tri = _UltraRTTriangles[inst.triangleOffset + hit.primitiveIndex];
+
+    float3 bary = float3(1.0 - hit.barycentrics.x - hit.barycentrics.y, hit.barycentrics.x, hit.barycentrics.y);
+    float3 localN = normalize(tri.n0 * bary.x + tri.n1 * bary.y + tri.n2 * bary.z);
+    float3 N = normalize(mul((float3x3)inst.normalMatrix, localN));
+    if (hit.isFrontFace == 0)
+        N = -N;
+
+    outHitNormalWS = N;
+
+    float2 rawUV = float2(tri.u0, tri.v0) * bary.x + float2(tri.u1, tri.v1) * bary.y + float2(tri.u2, tri.v2) * bary.z;
+    float2 scaledUV = rawUV * inst.emissionAndTexScale.w;
+
+    float3 albedo = ApplyProceduralPatternRT(inst.baseColorAndMetallic.rgb, scaledUV, inst.translucencyParams.w);
+    float metallic = saturate(inst.baseColorAndMetallic.w);
+    float smoothness = saturate(inst.surfaceParams.x);
+    float reflectance = inst.surfaceParams.y;
+    float clearCoatMask = inst.surfaceParams.z;
+
+    float perceptualRoughness = 1.0 - smoothness;
+    float roughness = max(0.03, perceptualRoughness * perceptualRoughness);
+
+    float dielectricF0 = 0.16 * reflectance * reflectance;
+    float3 f0 = lerp(float3(dielectricF0, dielectricF0, dielectricF0), albedo, metallic);
+
+    float3 V = -rayDir;
+    float NoV = saturate(abs(dot(N, V)) + 1e-5);
+    outFresnelWeight = f0 + (max(float3(smoothness, smoothness, smoothness), f0) - f0) * pow(1.0 - NoV, 5.0);
+    outReflectivity = saturate(smoothness * lerp(0.35, 1.0, max(metallic, clearCoatMask)));
+
+    float3 diffuseColor = albedo * (1.0 - metallic);
+
+    // Ambient hemisphere base
+    float skyFactor = saturate(N.y * 0.5 + 0.5);
+    float3 ambientIrradiance = lerp(_UltraGIGroundColor.rgb, _UltraGISkyColor.rgb, skyFactor) * 0.55;
+    float3 color = diffuseColor * ambientIrradiance;
+
+    // Directional Sun Light with Hardware Shadow Ray
+    float3 sunDir = normalize(_UltraMainLightDir.xyz);
+    float3 sunCol = _UltraMainLightColor.rgb;
+    float sunNoL_raw = dot(N, sunDir);
+    float sunNoL = saturate(sunNoL_raw);
+
+    float sunShadow = 1.0;
+    if (castShadowRay && (sunNoL > 0.0 || inst.sssColorAndStrength.w > 0.01))
+    {
+        if (TraceOcclusionRay(outHitPosWS + N * 0.02, sunDir, 0.01, 55.0))
+            sunShadow = 0.08;
+    }
+
+    if (sunNoL > 0.0)
+    {
+        float3 H = normalize(V + sunDir);
+        float NoH = saturate(dot(N, H));
+        float LoH = saturate(dot(sunDir, H));
+
+        float a2 = roughness * roughness;
+        float dDenom = (NoH * a2 - NoH) * NoH + 1.0;
+        float D = a2 / (kPI * dDenom * dDenom + 1e-6);
+        float3 F = f0 + (1.0 - f0) * pow(1.0 - LoH, 5.0);
+        float3 spec = min(8.0, D * 0.25) * F * sunNoL;
+
+        color += (diffuseColor * kInvPI * sunNoL + spec) * sunCol * sunShadow;
+    }
+
+    // Subsurface Wrap & Translucency on Hit Object
+    float sssStrength = inst.sssColorAndStrength.w;
+    if (sssStrength > 0.001)
+    {
+        float wrap = inst.translucencyParams.z;
+        float3 wrappedNoL = saturate((sunNoL_raw + wrap) / ((1.0 + wrap) * (1.0 + wrap)));
+        color += diffuseColor * inst.sssColorAndStrength.rgb * wrappedNoL * sssStrength * kInvPI * sunCol * lerp(0.35, 1.0, sunShadow);
+    }
+
+    // Punctual Point Lights (including Back-Lit SSS Translucency!)
+    int lightCount = (int)_UltraRTParams.x;
+    float transStrength = inst.translucencyParams.x;
+    float thickness = inst.translucencyParams.y;
+
+    for (int l = 0; l < lightCount; l++)
+    {
+        UltraRTPointLight pl = _UltraRTLights[l];
+        float3 toLight = pl.positionAndRange.xyz - outHitPosWS;
+        float distSq = dot(toLight, toLight);
+        float range = pl.positionAndRange.w;
+        if (distSq >= range * range)
+            continue;
+
+        float dist = sqrt(max(1e-5, distSq));
+        float3 L = toLight / dist;
+        float normDist = dist / range;
+        float atten = saturate(1.0 - normDist * normDist);
+        atten = (atten * atten) / (1.0 + distSq * 0.65);
+
+        float3 lCol = pl.colorAndIntensity.rgb * atten;
+        float NoL_p = saturate(dot(N, L));
+        color += diffuseColor * kInvPI * NoL_p * lCol;
+
+        if (sssStrength > 0.001 || transStrength > 0.001)
+        {
+            float3 transDir = normalize(L + N * 0.25);
+            float transDot = pow(saturate(dot(V, -transDir)), 3.5);
+            float thickAtten = exp(-thickness * 3.0);
+            color += diffuseColor * inst.sssColorAndStrength.rgb * (transDot * thickAtten * max(sssStrength, transStrength)) * lCol;
+        }
+    }
+
+    // HDR Emission
+    color += inst.emissionAndTexScale.rgb;
+    return max(0.0, color);
+}
+
+float EvaluateHenyeyGreensteinRT(float cosTheta, float g)
+{
+    float g2 = g * g;
+    float denom = max(0.001, 1.0 + g2 - 2.0 * g * cosTheta);
+    return (1.0 - g2) / (4.0 * kPI * denom * sqrt(denom));
+}
+
+[shader("raygeneration")]
+void UltraRayGen()
+{
+    uint2 launchIdx = DispatchRaysIndex().xy;
+    uint2 launchDim = DispatchRaysDimensions().xy;
+
+    float2 uv = (float2(launchIdx) + 0.5) / float2(launchDim);
+    int2 fullSizeI = int2(_UltraFullScreenSize.xy);
+    int2 fullCoord = clamp(int2(uv * _UltraFullScreenSize.xy), int2(0, 0), fullSizeI - 1);
+    int2 depthCoord = int2(fullCoord.x, (fullSizeI.y - 1) - fullCoord.y);
+
+    float2 ndc = uv * 2.0 - 1.0;
+    float aspect = _UltraCamProjParams.x;
+    float tanHalfFov = _UltraCamProjParams.y;
+    float3 viewRayWS = _UltraCamForward.xyz
+                     + (ndc.x * aspect * tanHalfFov) * _UltraCamRight.xyz
+                     + (ndc.y * tanHalfFov) * _UltraCamUp.xyz;
+    float3 viewRayDir = normalize(viewRayWS);
+
+    // Trace exact primary camera ray against Hardware DXR BVH for 32-bit position, 32-bit smooth normal, and material ID
+    UltraRayPayload primaryHit = TraceClosestRay(_UltraCamPosWS.xyz, viewRayDir, _UltraCamProjParams.z, _UltraCamProjParams.w);
+
+    float rawDepth = _CameraDepthTexture.Load(int3(depthCoord, 0)).r;
+    bool isSky = (primaryHit.instanceID < 0);
+    float centerDepth = (primaryHit.instanceID >= 0 && primaryHit.hitDistance > 0.0)
+        ? primaryHit.hitDistance
+        : LinearEyeDepthRT(rawDepth);
+
+    float3 posWS = isSky
+        ? (_UltraCamPosWS.xyz + viewRayDir * _UltraVolumetricParams.w)
+        : (_UltraCamPosWS.xyz + viewRayDir * primaryHit.hitDistance);
+
+    float3 directColor = _SourceColorTex.Load(int3(launchIdx, 0)).rgb;
+
+    float2 pixelCoord = float2(launchIdx);
+    float ign = InterleavedGradientNoiseRT(pixelCoord);
+
+    float3 sunDirWS = normalize(_UltraMainLightDir.xyz);
+    bool rtShadowsEnabled = _UltraRTParams.w > 0.5;
+
+    // ------------------------------------------------------------------
+    // 1. Volumetric Mie Light Shafts using Hardware Shadow Rays
+    // ------------------------------------------------------------------
+    float volumetricAccum = 0.0;
+    if (_UltraVolumetricParams.x > 0.5 && _UltraVolumetricParams.y > 0.001)
+    {
+        int volSteps = clamp((int)_UltraVolumetricParams.z, 4, 16);
+        float maxVolDist = _UltraVolumetricParams.w;
+        float targetDist = isSky ? maxVolDist : min(centerDepth, maxVolDist);
+
+        float cosTheta = dot(viewRayDir, sunDirWS);
+        float miePhase = clamp(EvaluateHenyeyGreensteinRT(cosTheta, _UltraVolumetricParams2.x) * 0.42, 0.04, 0.55);
+
+        float stepLen = targetDist / (float)volSteps;
+        float heightFalloff = _UltraVolumetricParams2.y;
+
+        float accumScattering = 0.0;
+        for (int v = 0; v < volSteps; v++)
+        {
+            float marchDist = ((float)v + ign) * stepLen;
+            float3 samplePosWS = _UltraCamPosWS.xyz + viewRayDir * marchDist;
+
+            bool occluded = TraceOcclusionRay(samplePosWS, sunDirWS, 0.05, 45.0);
+            float shadowAtten = occluded ? 0.0 : 1.0;
+
+            float heightDensity = exp(-max(0.0, samplePosWS.y) * heightFalloff);
+            float transmittance = exp(-marchDist * 0.045);
+
+            accumScattering += shadowAtten * heightDensity * transmittance;
+        }
+
+        float opticalDepth = 1.0 - exp(-targetDist * 0.038);
+        volumetricAccum = (accumScattering / (float)volSteps) * miePhase * opticalDepth * _UltraVolumetricParams.y;
+    }
+
+    if (isSky)
+    {
+        _OutRTAO[launchIdx] = float4(1.0, 1.0, 1.0, 1.0);
+        _OutRTGIAndShadows[launchIdx] = float4(0.0, 0.0, 0.0, 1.0);
+        _OutRTReflectionsAndVolumetrics[launchIdx] = float4(0.0, 0.0, 0.0, volumetricAccum);
+        _OutRTSubsurface[launchIdx] = float4(directColor, 0.0);
+        return;
+    }
+
+    float4 normalSample = _CameraNormalsTexture.Load(int3(fullCoord, 0));
+    float3 N = normalSample.xyz;
+    float lenSq = dot(N, N);
+    N = (lenSq > 0.001) ? (N * rsqrt(lenSq)) : float3(0.0, 1.0, 0.0);
+    float reflectivity = saturate(normalSample.w);
+
+    float3 V = -viewRayDir;
+
+    float3 primaryAlbedo = float3(0.85, 0.85, 0.85);
+    float primaryMetallic = 0.0;
+    float primarySmoothness = reflectivity;
+    float primaryClearCoat = 0.0;
+    float primarySSSStrength = 0.0;
+    float3 primarySSSColor = _UltraSSSScatterColor.rgb;
+
+    if (primaryHit.instanceID >= 0)
+    {
+        UltraRTInstanceData pInst = _UltraRTInstances[primaryHit.instanceID];
+        UltraRTTriangle pTri = _UltraRTTriangles[pInst.triangleOffset + primaryHit.primitiveIndex];
+        float3 pBary = float3(1.0 - primaryHit.barycentrics.x - primaryHit.barycentrics.y, primaryHit.barycentrics.x, primaryHit.barycentrics.y);
+        float3 pLocalN = normalize(pTri.n0 * pBary.x + pTri.n1 * pBary.y + pTri.n2 * pBary.z);
+        float3 pWorldN = normalize(mul((float3x3)pInst.normalMatrix, pLocalN));
+        if (primaryHit.isFrontFace == 0)
+            pWorldN = -pWorldN;
+
+        // Use full 32-bit float normal from the BVH triangle instead of 8-bit quantized _CameraNormalsTexture
+        N = pWorldN;
+
+        primaryAlbedo = pInst.baseColorAndMetallic.rgb;
+        primaryMetallic = saturate(pInst.baseColorAndMetallic.w);
+        primarySmoothness = saturate(pInst.surfaceParams.x);
+        primaryClearCoat = saturate(pInst.surfaceParams.z);
+        reflectivity = saturate(max(primarySmoothness, primaryClearCoat * 0.92));
+        primarySSSStrength = pInst.sssColorAndStrength.w;
+        if (primarySSSStrength > 0.001)
+            primarySSSColor = pInst.sssColorAndStrength.rgb;
+    }
+
+    float3 rayOrigin = posWS + N * 0.02;
+
+    // ------------------------------------------------------------------
+    // 2. Hardware Ray-Traced Direct & Contact Shadows
+    // ------------------------------------------------------------------
+    float contactShadow = 1.0;
+    if (_UltraContactShadowParams.x > 0.5 && rtShadowsEnabled)
+    {
+        float NoL = dot(N, sunDirWS);
+        if (NoL > 0.01)
+        {
+            bool shadowHit = TraceOcclusionRay(rayOrigin, sunDirWS, 0.01, _UltraContactShadowParams.y * 3.5);
+            if (shadowHit)
+                contactShadow = 1.0 - saturate(_UltraContactShadowParams.z * 0.72);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 3. Hardware Ray-Traced Ambient Occlusion (RTAO) & Global Illumination (RTGI)
+    // ------------------------------------------------------------------
+    float3 T, B;
+    BuildOrthonormalBasisRT(N, T, B);
+
+    int giRayCount = clamp((int)_UltraRTParams.z, 1, 12);
+    float aoRadius = _UltraAOParams1.y;
+    float giRadius = _UltraGIParams1.w;
+    float maxTraceRadius = max(aoRadius, giRadius);
+
+    float aoHits = 0.0;
+    float3 indirectGI = 0.0;
+
+    for (int r = 0; r < giRayCount; r++)
+    {
+        float fi = ((float)r + 0.5) / (float)giRayCount;
+        float phi = kTwoPI * frac((float)r * 0.61803398875 + ign);
+        float sinTheta = sqrt(fi);
+        float cosTheta = sqrt(max(0.0, 1.0 - fi));
+
+        float3 localDir = float3(cos(phi) * sinTheta, sin(phi) * sinTheta, cosTheta);
+        float3 rayDirWS = normalize(T * localDir.x + B * localDir.y + N * localDir.z);
+
+        UltraRayPayload giHit = TraceClosestRay(rayOrigin, rayDirWS, 0.015, maxTraceRadius);
+        if (giHit.instanceID >= 0 && giHit.hitDistance > 0.0)
+        {
+            if (giHit.hitDistance < aoRadius)
+            {
+                float aoFalloff = 1.0 - saturate(giHit.hitDistance / aoRadius);
+                aoHits += aoFalloff;
+            }
+
+            if (_UltraGIParams1.x > 0.001 && giHit.hitDistance < giRadius)
+            {
+                float3 dummyPos, dummyN, dummyF;
+                float dummyRefl;
+                float3 hitRadiance = ShadeRayHit(giHit, rayOrigin, rayDirWS, rtShadowsEnabled, dummyPos, dummyN, dummyRefl, dummyF);
+
+                float luma = LuminanceRT(hitRadiance);
+                float boost = 1.0 + saturate(luma - 0.75) * (_UltraGIParams2.y - 1.0);
+                float distAtten = 1.0 / (1.0 + giHit.hitDistance * 0.28);
+
+                indirectGI += min(hitRadiance * boost * distAtten, 12.0);
+            }
+        }
+        else if (_UltraGIParams1.x > 0.001)
+        {
+            float skyFactor = saturate(rayDirWS.y * 0.5 + 0.5);
+            indirectGI += lerp(_UltraGIGroundColor.rgb, _UltraGISkyColor.rgb, skyFactor) * _UltraGIParams2.w;
+        }
+    }
+
+    // Finalize RTAO with Multi-Bounce Albedo Color Bleeding
+    float aoFraction = aoHits / (float)giRayCount;
+    float distanceFade = saturate(1.0 - centerDepth / max(1.0, _UltraAOParams2.w));
+    float aoScalar = pow(saturate(1.0 - aoFraction * _UltraAOParams1.x * distanceFade), _UltraAOParams1.z);
+    if (_UltraAOParams1.w <= 0.0001 && _UltraAOParams1.x <= 0.0001)
+        aoScalar = 1.0;
+
+    float3 approxAlbedo = saturate(primaryAlbedo);
+    float3 multiBounceAO = aoScalar / max(float3(0.001, 0.001, 0.001), aoScalar * (1.0 - approxAlbedo) + approxAlbedo);
+    float3 finalAOColor = lerp(float3(aoScalar, aoScalar, aoScalar), multiBounceAO, _UltraAOParams2.z);
+
+    // Finalize RTGI
+    indirectGI /= (float)giRayCount;
+    float giLuma = LuminanceRT(indirectGI);
+    indirectGI = max(0.0, lerp(float3(giLuma, giLuma, giLuma), indirectGI, _UltraGIParams2.z)) * _UltraGIParams1.x;
+
+    // ------------------------------------------------------------------
+    // 4. Multi-Bounce Hardware Ray-Traced Reflections (Clean, Noise-Free Mirror/Glossy Reflection)
+    // ------------------------------------------------------------------
+    float3 reflectionOut = 0.0;
+    float reflectionReplaceWeight = 0.0;
+
+    if (_UltraSSRParams.x > 0.5 && _UltraSSRParams.y > 0.001 && reflectivity > 0.12)
+    {
+        float NoV = saturate(dot(N, V));
+        float dielectricF0 = lerp(0.04, 0.14, primarySmoothness) + primaryClearCoat * 0.12;
+        float3 f0 = lerp(float3(dielectricF0, dielectricF0, dielectricF0), primaryAlbedo, primaryMetallic);
+        float3 maxF = max(float3(primarySmoothness, primarySmoothness, primarySmoothness), f0);
+        float3 primaryFresnel = f0 + (maxF - f0) * pow(1.0 - NoV, _UltraSSRParams2.y);
+
+        float ccFresnel = (0.12 + 0.88 * pow(1.0 - NoV, 4.0)) * primaryClearCoat;
+        float3 combinedTint = lerp(primaryFresnel, float3(1.0, 1.0, 1.0), ccFresnel * 0.55);
+
+        // Clean deterministic reflection ray without 1-SPP white-noise speckles
+        float3 R1 = reflect(-V, N);
+        float smoothnessFactor = primarySmoothness * primarySmoothness;
+        float ssrGain = saturate(_UltraSSRParams.y);
+
+        UltraRayPayload reflHit1 = TraceClosestRay(rayOrigin, R1, 0.015, _UltraSSRParams.w * 2.5);
+        if (reflHit1.instanceID >= 0 && reflHit1.hitDistance > 0.0)
+        {
+            float3 hitPos1, hitN1, hitFresnel1;
+            float hitRefl1;
+            float3 reflColor1 = ShadeRayHit(reflHit1, rayOrigin, R1, rtShadowsEnabled, hitPos1, hitN1, hitRefl1, hitFresnel1);
+
+            // Second Hardware Reflection Bounce (inter-sphere & mirror-in-mirror reflections!)
+            int maxBounces = clamp((int)_UltraRTParams.y, 1, 3);
+            if (maxBounces >= 2 && hitRefl1 > 0.35)
+            {
+                float3 R2 = reflect(R1, hitN1);
+                UltraRayPayload reflHit2 = TraceClosestRay(hitPos1 + hitN1 * 0.025, R2, 0.015, _UltraSSRParams.w * 2.0);
+                float3 reflColor2;
+                if (reflHit2.instanceID >= 0 && reflHit2.hitDistance > 0.0)
+                {
+                    float3 dummyPos2, dummyN2, dummyF2;
+                    float dummyRefl2;
+                    reflColor2 = ShadeRayHit(reflHit2, hitPos1 + hitN1 * 0.025, R2, false, dummyPos2, dummyN2, dummyRefl2, dummyF2);
+                }
+                else
+                {
+                    reflColor2 = EvaluateProceduralSkyRT(R2);
+                }
+                reflColor1 = lerp(reflColor1, reflColor2 * hitFresnel1, saturate(hitRefl1 * 0.85));
+            }
+
+            reflectionReplaceWeight = saturate(lerp(max(LuminanceRT(primaryFresnel), ccFresnel) * 0.65, smoothnessFactor, primaryMetallic) * ssrGain);
+            reflectionOut = reflColor1 * combinedTint * smoothnessFactor * ssrGain;
+        }
+        else
+        {
+            float3 skyRefl = EvaluateProceduralSkyRT(R1);
+            reflectionReplaceWeight = saturate(lerp(max(LuminanceRT(primaryFresnel), ccFresnel) * 0.65, smoothnessFactor, primaryMetallic) * ssrGain);
+            reflectionOut = skyRefl * combinedTint * smoothnessFactor * ssrGain;
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 5. Hardware Ray-Traced Subsurface Thickness & Translucency
+    // ------------------------------------------------------------------
+    float3 sssOutColor = directColor;
+    if (_UltraSSSParams.x > 0.5 && _UltraSSSParams.y > 0.001)
+    {
+        float trueThickness = 1.2;
+        if (primarySSSStrength > 0.01)
+        {
+            UltraRayPayload internalHit = TraceClosestRay(posWS - N * 0.015, -N, 0.005, 2.5);
+            if (internalHit.instanceID >= 0 && internalHit.hitDistance > 0.0)
+                trueThickness = internalHit.hitDistance;
+        }
+
+        float3 mfp = max(float3(0.08, 0.08, 0.08), primarySSSColor);
+        float3 transmittanceRGB = exp(-trueThickness / (mfp * 1.35));
+        float thinnessMask = saturate(1.0 - trueThickness * 0.55) * saturate(0.25 + primarySSSStrength);
+
+        sssOutColor = directColor + directColor * transmittanceRGB * thinnessMask * (_UltraSSSParams.y * 0.55);
+    }
+
+    _OutRTAO[launchIdx] = float4(finalAOColor, aoScalar);
+    _OutRTGIAndShadows[launchIdx] = float4(indirectGI, contactShadow);
+    _OutRTReflectionsAndVolumetrics[launchIdx] = float4(reflectionOut, volumetricAccum);
+    _OutRTSubsurface[launchIdx] = float4(sssOutColor, reflectionReplaceWeight);
+}
+
+[shader("closesthit")]
+void UltraClosestHit(inout UltraRayPayload payload : SV_RayPayload, AttributeData attribs : SV_IntersectionAttributes)
+{
+    payload.instanceID = (int)InstanceID();
+    payload.primitiveIndex = PrimitiveIndex();
+    payload.barycentrics = attribs.barycentrics;
+    payload.hitDistance = RayTCurrent();
+    payload.isFrontFace = (HitKind() == HIT_KIND_TRIANGLE_FRONT_FACE) ? 1u : 0u;
+}
+
+[shader("miss")]
+void UltraMiss(inout UltraRayPayload payload : SV_RayPayload)
+{
+    payload.instanceID = -1;
+    payload.hitDistance = -1.0;
+}

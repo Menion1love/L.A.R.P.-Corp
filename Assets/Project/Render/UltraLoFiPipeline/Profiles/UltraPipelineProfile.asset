@@ -1,0 +1,116 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: b616ef5c87dcf39439513aba8a38a193, type: 3}
+  m_Name: UltraPipelineProfile
+  m_EditorClassIdentifier: Assembly-CSharp::UltraLoFiPipeline.UltraPipelineProfile
+  useHardwareRayTracing: 1
+  rtReflectionBounces: 2
+  rtGIRaysPerPixel: 6
+  rtHardwareShadows: 1
+  rtTrueSubsurfaceThickness: 1
+  enableLowResRendering: 1
+  sizingMode: 0
+  targetVerticalHeight: 720
+  downscaleFactor: 4
+  customResolution: {x: 240, y: 240}
+  upscaleFilter: 0
+  aspectRatioMode: 0
+  syncHardwareRenderScale: 1
+  exposeLowResRenderTexture: 1
+  forceDisableAntiAliasing: 1
+  edgeAliasingSharpen: 0.033
+  specularAliasingBoost: 0.227
+  enableDithering: 1
+  ditherMode: 2
+  ditherStrength: 0.06
+  colorStepsPerChannel: 256
+  pixelGridOverlay: 0.03
+  enableSSGI: 1
+  giIntensity: 1.5
+  giRayCount: 6
+  giStepsPerRay: 10
+  giRayRadius: 6
+  giThickness: 0.45
+  giEmissiveBoost: 2.4
+  giBounceSaturation: 1.25
+  giSkyAmbientTint: {r: 0.56, g: 0.68, b: 0.92, a: 1}
+  giGroundAmbientTint: {r: 0.26, g: 0.21, b: 0.17, a: 1}
+  giSkyContribution: 0.35
+  giDenoiseIterations: 2
+  giDenoiseDepthWeight: 28
+  giDenoiseNormalWeight: 18
+  enableAO: 1
+  aoIntensity: 1.3
+  aoRadius: 0.75
+  aoPower: 1.5
+  aoDirectionCount: 6
+  aoStepsPerDirection: 6
+  aoDirectLightOcclusion: 0.35
+  aoMultiBounceTint: 0.7
+  aoMaxDistance: 75
+  enableSubsurfaceScattering: 1
+  sssIntensity: 0.95
+  sssRadius: 1.6
+  sssScatterColor: {r: 1, g: 0.34, b: 0.18, a: 1}
+  sssDepthFalloff: 32
+  enableContactShadows: 1
+  contactShadowLength: 0.4
+  contactShadowIntensity: 0.75
+  contactShadowSteps: 12
+  enableSSR: 1
+  ssrIntensity: 0.88
+  ssrMaxSteps: 24
+  ssrMaxDistance: 25
+  ssrThickness: 0.3
+  ssrFresnelPower: 4
+  enableVolumetricLighting: 1
+  volumetricIntensity: 0.65
+  volumetricSteps: 12
+  volumetricMaxDistance: 35
+  volumetricMieAnisotropy: 0.65
+  volumetricFogColor: {r: 1, g: 0.92, b: 0.78, a: 1}
+  volumetricHeightFalloff: 0.24
+  enableBloom: 1
+  bloomThreshold: 0.9
+  bloomSoftKnee: 0.55
+  bloomIntensity: 0.72
+  bloomScatter: 0.7
+  bloomTint: {r: 1, g: 0.96, b: 0.9, a: 1}
+  bloomAnamorphicRatio: 0
+  bloomIterations: 4
+  enableChromaticAberration: 1
+  chromaticAberrationIntensity: 0.02
+  chromaticAberrationRadialPower: 1.53
+  chromaticAberrationSamples: 4
+  enableDepthOfField: 0
+  dofFocusDistance: 6.5
+  dofFocusRange: 4
+  dofBokehRadius: 2
+  enableVignette: 1
+  vignetteIntensity: 0.28
+  vignetteSmoothness: 0.45
+  vignetteColor: {r: 0.03, g: 0.02, b: 0.04, a: 1}
+  enableFilmGrain: 1
+  filmGrainIntensity: 0.04
+  filmGrainResponse: 0.8
+  lensDistortion: 0
+  toneMapping: 3
+  postExposureEV: 0.25
+  whiteBalanceTemperature: 0.02
+  whiteBalanceTint: 0
+  contrast: 1.12
+  saturation: 1.08
+  shadowsTint: {r: 0.95, g: 0.97, b: 1.04, a: 1}
+  midtonesTint: {r: 1, g: 1, b: 1, a: 1}
+  highlightsTint: {r: 1.03, g: 1, b: 0.96, a: 1}
+  gamma: 1.068
+  debugView: 0
